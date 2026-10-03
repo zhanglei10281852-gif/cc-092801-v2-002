@@ -13,6 +13,9 @@ class TemplateCreate(BaseModel):
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
     max_attempts: int = Field(default=3, ge=1, le=20)
+    base_fee_cents: int = Field(default=0, ge=0, le=100_000_000)
+    unit_fee_cents: int = Field(default=0, ge=0, le=100_000_000)
+    billing_unit_seconds: int = Field(default=60, ge=1, le=3600)
 
 
 class QuotaSet(BaseModel):
@@ -42,6 +45,7 @@ class TaskResult(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
     result: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, min_length=6, max_length=160)
 
 
 class TaskFailure(BaseModel):
@@ -49,11 +53,13 @@ class TaskFailure(BaseModel):
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True
+    idempotency_key: str | None = Field(default=None, min_length=6, max_length=160)
 
 
 class CancelRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=2, max_length=1000)
+    idempotency_key: str | None = Field(default=None, min_length=6, max_length=160)
 
 
 class RetryRequest(BaseModel):

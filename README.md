@@ -64,3 +64,28 @@ tools/              本地维护脚本
 ## 数据一致性
 
 SQLite 连接启用外键、WAL 和忙等待策略。提交、领取、回执和人工干预在即时事务中完成；租约、配额与结果版本使用可注入时钟，便于复现跨日和恢复边界。会话令牌只保存摘要，审计与人工干预记录不会写入明文密码或令牌。
+
+## 取消与现场回执的收敛规则
+
+家属或客服对服务订单发起取消后，取消请求与现场执行按以下规则收敛，保证费用不会被迟到回执重新激活：
+
+- `queued`（尚未开始）：取消立即终态 `cancelled`，基础费与执行费全额 `waived`。
+- `running`（正在执行）：取消进入 `cancel_requested`，记录决定人、原因与**计费停止时刻**；工作者下一次 complete/fail 回执时收敛为 `cancelled`，执行费只计算到取消请求时刻（按模板计费单位向上取整）。
+- 终态任务（`cancelled`/`succeeded`/`failed`）收到迟到回执：登记为 `late_rejected` 并留痕，状态与费用不变，服务不会被重新激活。
+- `cancel_requested` 任务的租约过期且现场始终未回执时，恢复任务按取消请求时刻结算并收敛为 `cancelled`。
+- 重复取消、重复回执（回执 `idempotency_key`，或按工作者+载荷+执行轮次生成的自动键）以及人工重试都返回稳定结果；重试后属于新一轮结算（`settlement_seq`），排队等待时间不计入执行时长。
+- 每次取消、回执、迟到拒绝、租约恢复和人工干预同时写入 `compute_interventions` 与 `audit_events`（含 actor、时间、前后状态），可通过 `/api/audit?resource_type=compute_task` 还原谁在何时做了决定。
+
+模板创建时可声明计费字段（单位：分）：`base_fee_cents`、`unit_fee_cents`、`billing_unit_seconds`。
+
+费用与订单查询接口：
+
+```bash
+# 单个订单：状态、费用明细（compute_charges）、结果版本、干预记录
+curl -sS http://127.0.0.1:8432/api/compute/task-details/12
+# 项目维度：汇总金额与逐单费用明细
+curl -sS http://127.0.0.1:8432/api/compute/projects/demo/billing
+```
+
+取消与回执请求体均支持可选的 `idempotency_key`，响应中带 `cancellation.duplicate` 或 `receipt.disposition`（`accepted`/`cancelled`/`late_rejected`）指示本次结果的来源。
+

@@ -226,6 +226,9 @@ CREATE TABLE IF NOT EXISTS compute_templates (
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
     max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    base_fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(base_fee_cents >= 0),
+    unit_fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(unit_fee_cents >= 0),
+    billing_unit_seconds INTEGER NOT NULL DEFAULT 60 CHECK(billing_unit_seconds BETWEEN 1 AND 3600),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -261,6 +264,16 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    base_fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(base_fee_cents >= 0),
+    unit_fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(unit_fee_cents >= 0),
+    billing_unit_seconds INTEGER NOT NULL DEFAULT 60 CHECK(billing_unit_seconds BETWEEN 1 AND 3600),
+    billable_seconds INTEGER NOT NULL DEFAULT 0 CHECK(billable_seconds >= 0),
+    charged_cents INTEGER NOT NULL DEFAULT 0 CHECK(charged_cents >= 0),
+    settlement_seq INTEGER NOT NULL DEFAULT 0 CHECK(settlement_seq >= 0),
+    cancellation_actor TEXT NOT NULL DEFAULT '',
+    cancellation_reason TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    billed_at TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -270,6 +283,35 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at);
 CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at);
+CREATE TABLE IF NOT EXISTS compute_charges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    settlement_seq INTEGER NOT NULL DEFAULT 0 CHECK(settlement_seq >= 0),
+    fee_type TEXT NOT NULL CHECK(fee_type IN ('base','execution','cancellation')),
+    amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
+    quantity_seconds INTEGER NOT NULL DEFAULT 0 CHECK(quantity_seconds >= 0),
+    status TEXT NOT NULL CHECK(status IN ('billed','waived','refunded')),
+    reason TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, settlement_seq, fee_type)
+);
+CREATE INDEX IF NOT EXISTS idx_compute_charges_task ON compute_charges(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    receipt_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('complete','fail')),
+    worker_id TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK(disposition IN ('accepted','late_rejected','cancelled')),
+    resulting_status TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, receipt_key)
+);
+CREATE INDEX IF NOT EXISTS idx_compute_receipts_task ON compute_receipts(task_id,id);
 CREATE TABLE IF NOT EXISTS compute_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
@@ -290,6 +332,7 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     before_json TEXT NOT NULL,
     after_json TEXT NOT NULL,
     batch_key TEXT NOT NULL DEFAULT '',
+    request_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
@@ -363,6 +406,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_compute_schema(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -389,3 +433,72 @@ def init_db() -> None:
 
 def migrate_db() -> None:
     init_db()
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _migrate_compute_schema(connection: sqlite3.Connection) -> None:
+    """为升级前已存在的数据库补齐计费与取消收敛字段。"""
+    for column, ddl in (
+        ("base_fee_cents", "INTEGER NOT NULL DEFAULT 0 CHECK(base_fee_cents >= 0)"),
+        ("unit_fee_cents", "INTEGER NOT NULL DEFAULT 0 CHECK(unit_fee_cents >= 0)"),
+        ("billing_unit_seconds", "INTEGER NOT NULL DEFAULT 60 CHECK(billing_unit_seconds BETWEEN 1 AND 3600)"),
+    ):
+        _ensure_column(connection, "compute_templates", column, ddl)
+    for column, ddl in (
+        ("base_fee_cents", "INTEGER NOT NULL DEFAULT 0 CHECK(base_fee_cents >= 0)"),
+        ("unit_fee_cents", "INTEGER NOT NULL DEFAULT 0 CHECK(unit_fee_cents >= 0)"),
+        ("billing_unit_seconds", "INTEGER NOT NULL DEFAULT 60 CHECK(billing_unit_seconds BETWEEN 1 AND 3600)"),
+        ("billable_seconds", "INTEGER NOT NULL DEFAULT 0 CHECK(billable_seconds >= 0)"),
+        ("charged_cents", "INTEGER NOT NULL DEFAULT 0 CHECK(charged_cents >= 0)"),
+        ("settlement_seq", "INTEGER NOT NULL DEFAULT 0 CHECK(settlement_seq >= 0)"),
+        ("cancellation_actor", "TEXT NOT NULL DEFAULT ''"),
+        ("cancellation_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("cancel_requested_at", "TEXT NOT NULL DEFAULT ''"),
+        ("billed_at", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        _ensure_column(connection, "compute_tasks", column, ddl)
+    _ensure_column(connection, "compute_interventions", "request_key", "TEXT NOT NULL DEFAULT ''")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS compute_charges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+            settlement_seq INTEGER NOT NULL DEFAULT 0 CHECK(settlement_seq >= 0),
+            fee_type TEXT NOT NULL CHECK(fee_type IN ('base','execution','cancellation')),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
+            quantity_seconds INTEGER NOT NULL DEFAULT 0 CHECK(quantity_seconds >= 0),
+            status TEXT NOT NULL CHECK(status IN ('billed','waived','refunded')),
+            reason TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, settlement_seq, fee_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_compute_charges_task ON compute_charges(task_id,id);
+        CREATE TABLE IF NOT EXISTS compute_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+            receipt_key TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('complete','fail')),
+            worker_id TEXT NOT NULL,
+            payload_digest TEXT NOT NULL,
+            disposition TEXT NOT NULL CHECK(disposition IN ('accepted','late_rejected','cancelled')),
+            resulting_status TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, receipt_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_compute_receipts_task ON compute_receipts(task_id,id);
+        CREATE INDEX IF NOT EXISTS idx_compute_interventions_request ON compute_interventions(task_id,action,request_key) WHERE request_key<>'';
+        """
+    )
+
+
+def migrate_compute_schema() -> None:
+    with transaction(immediate=True) as connection:
+        _migrate_compute_schema(connection)

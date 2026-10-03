@@ -21,10 +21,10 @@ class ComputeRepository:
         rows = self.connection.execute("SELECT * FROM compute_templates WHERE active=1 ORDER BY code,version").fetchall()
         return [dict(row) for row in rows]
 
-    def create_template(self, *, code: str, name: str, algorithm: str, parameter_schema: dict[str, Any], defaults: dict[str, Any], max_runtime_seconds: int, max_attempts: int, created_by: str, now: str) -> dict[str, Any]:
+    def create_template(self, *, code: str, name: str, algorithm: str, parameter_schema: dict[str, Any], defaults: dict[str, Any], max_runtime_seconds: int, max_attempts: int, created_by: str, now: str, base_fee: int = 0, unit_fee: int = 0, billing_unit_seconds: int = 60) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO compute_templates(code,name,algorithm,version,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,active,created_by,created_at,updated_at) VALUES(?,?,?,1,?,?,?,?,1,?,?,?)",
-            (code, name, algorithm, json.dumps(parameter_schema, ensure_ascii=False, sort_keys=True), json.dumps(defaults, ensure_ascii=False, sort_keys=True), max_runtime_seconds, max_attempts, created_by, now, now),
+            "INSERT INTO compute_templates(code,name,algorithm,version,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,base_fee,unit_fee,billing_unit_seconds,active,created_by,created_at,updated_at) VALUES(?,?,?,1,?,?,?,?,?,?,?,1,?,?,?)",
+            (code, name, algorithm, json.dumps(parameter_schema, ensure_ascii=False, sort_keys=True), json.dumps(defaults, ensure_ascii=False, sort_keys=True), max_runtime_seconds, max_attempts, base_fee, unit_fee, billing_unit_seconds, created_by, now, now),
         )
         return dict(self.template_by_id(cursor.lastrowid))
 
@@ -77,10 +77,19 @@ class ComputeRepository:
     def interventions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_interventions WHERE task_id=? ORDER BY id", (task_id,)).fetchall()]
 
-    def add_intervention(self, *, task_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str) -> None:
+    def receipts(self, task_id: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT id,kind,worker_id,receipt_digest,accepted,request_key,created_at FROM compute_receipts WHERE task_id=? ORDER BY id", (task_id,)).fetchall()]
+
+    def receipt_by_digest(self, task_id: int, receipt_digest: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM compute_receipts WHERE task_id=? AND receipt_digest=? ORDER BY id LIMIT 1",
+            (task_id, receipt_digest),
+        ).fetchone()
+
+    def add_intervention(self, *, task_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str, request_key: str = "") -> None:
         self.connection.execute(
-            "INSERT INTO compute_interventions(task_id,actor,action,reason,before_json,after_json,batch_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (task_id, actor, action, reason, json.dumps(before, ensure_ascii=False, sort_keys=True), json.dumps(after, ensure_ascii=False, sort_keys=True), batch_key, now),
+            "INSERT INTO compute_interventions(task_id,actor,action,reason,before_json,after_json,batch_key,request_key,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (task_id, actor, action, reason, json.dumps(before, ensure_ascii=False, sort_keys=True), json.dumps(after, ensure_ascii=False, sort_keys=True), batch_key, request_key, now),
         )
 
     def list_tasks(self, *, status: str | None, project_code: str | None, requested_by: str | None, limit: int) -> list[dict[str, Any]]:

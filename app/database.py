@@ -226,6 +226,9 @@ CREATE TABLE IF NOT EXISTS compute_templates (
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
     max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    base_fee INTEGER NOT NULL DEFAULT 0 CHECK(base_fee >= 0),
+    unit_fee INTEGER NOT NULL DEFAULT 0 CHECK(unit_fee >= 0),
+    billing_unit_seconds INTEGER NOT NULL DEFAULT 60 CHECK(billing_unit_seconds > 0),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -261,6 +264,14 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT,
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancelled_at TEXT,
+    billing_stopped_at TEXT,
+    billing_seconds INTEGER,
+    billing_amount INTEGER,
+    billing_detail_json TEXT NOT NULL DEFAULT '{}',
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -277,6 +288,8 @@ CREATE TABLE IF NOT EXISTS compute_results (
     result_json TEXT NOT NULL,
     metrics_json TEXT NOT NULL DEFAULT '{}',
     result_digest TEXT NOT NULL,
+    receipt_digest TEXT,
+    accepted INTEGER NOT NULL DEFAULT 1 CHECK(accepted IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(task_id, version)
@@ -290,9 +303,23 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     before_json TEXT NOT NULL,
     after_json TEXT NOT NULL,
     batch_key TEXT NOT NULL DEFAULT '',
+    request_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('complete','fail')),
+    worker_id TEXT NOT NULL,
+    receipt_digest TEXT NOT NULL,
+    accepted INTEGER NOT NULL CHECK(accepted IN (0,1)),
+    request_key TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, receipt_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_compute_receipts_task ON compute_receipts(task_id,id);
 '''
 
 PERMISSIONS = [
@@ -359,10 +386,55 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _apply_compute_migrations(connection: sqlite3.Connection) -> None:
+    """为已存在的数据库补齐收敛规则所需的列（新库由 SCHEMA 直接建立）。"""
+
+    def columns(table: str) -> set[str]:
+        return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    task_columns = columns("compute_tasks")
+    task_additions = {
+        "cancel_requested_at": "TEXT",
+        "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
+        "cancel_reason": "TEXT NOT NULL DEFAULT ''",
+        "cancelled_at": "TEXT",
+        "billing_stopped_at": "TEXT",
+        "billing_seconds": "INTEGER",
+        "billing_amount": "INTEGER",
+        "billing_detail_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for name, declaration in task_additions.items():
+        if name not in task_columns:
+            connection.execute(f"ALTER TABLE compute_tasks ADD COLUMN {name} {declaration}")
+    template_columns = columns("compute_templates")
+    for name, declaration in {
+        "base_fee": "INTEGER NOT NULL DEFAULT 0 CHECK(base_fee >= 0)",
+        "unit_fee": "INTEGER NOT NULL DEFAULT 0 CHECK(unit_fee >= 0)",
+        "billing_unit_seconds": "INTEGER NOT NULL DEFAULT 60 CHECK(billing_unit_seconds > 0)",
+    }.items():
+        if name not in template_columns:
+            connection.execute(f"ALTER TABLE compute_templates ADD COLUMN {name} {declaration}")
+    result_columns = columns("compute_results")
+    if "receipt_digest" not in result_columns:
+        connection.execute("ALTER TABLE compute_results ADD COLUMN receipt_digest TEXT")
+    if "accepted" not in result_columns:
+        connection.execute("ALTER TABLE compute_results ADD COLUMN accepted INTEGER NOT NULL DEFAULT 1")
+    intervention_columns = columns("compute_interventions")
+    if "request_key" not in intervention_columns:
+        connection.execute("ALTER TABLE compute_interventions ADD COLUMN request_key TEXT NOT NULL DEFAULT ''")
+    # 旧版本遗留的 cancel_requested 行没有取消请求时间戳；新版本在途的取消请求
+    # 总是带有 cancel_requested_at，因此这里只会收敛历史滞留数据。
+    if "cancel_requested_at" not in task_columns:
+        connection.execute(
+            "UPDATE compute_tasks SET status='cancelled',cancelled_at=COALESCE(cancelled_at,updated_at),finished_at=COALESCE(finished_at,updated_at) WHERE status='cancel_requested' AND cancel_requested_at IS NULL"
+        )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _apply_compute_migrations(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

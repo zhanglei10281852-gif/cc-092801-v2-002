@@ -54,17 +54,29 @@ def heartbeat(task_id: int, payload: TaskClaim):
 
 @router.post("/tasks/{task_id}/complete")
 def complete_task(task_id: int, payload: TaskResult):
-    return service().complete(task_id, payload.worker_id, payload.result, payload.metrics)
+    return service().complete(task_id, payload.worker_id, payload.result, payload.metrics, payload.request_key)
 
 
 @router.post("/tasks/{task_id}/fail")
 def fail_task(task_id: int, payload: TaskFailure):
-    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable)
+    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable, payload.request_key)
 
 
 @router.post("/tasks/{task_id}/cancel")
 def cancel_task(task_id: int, payload: CancelRequest):
-    return service().cancel(task_id, payload.actor, payload.reason)
+    return service().cancel(task_id, payload.actor, payload.reason, request_key=payload.request_key)
+
+
+@router.get("/task-details/{task_id}/billing")
+def task_billing(task_id: int):
+    task = service().get_task(task_id)
+    return {
+        "task_id": task_id,
+        "project_code": task["project_code"],
+        "status": task["status"],
+        "billing": task["billing"],
+        "cancellation": task["cancellation"],
+    }
 
 
 @router.post("/tasks/{task_id}/retry")
